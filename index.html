@@ -1,0 +1,143 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video to WebP</title>
+<style>
+  body{margin:0;background:#111;color:#eee;font:15px/1.4 system-ui,sans-serif;display:grid;place-items:start center;padding:32px 16px}
+  main{width:100%;max-width:640px;display:grid;gap:16px}
+  label{display:grid;gap:4px}
+  input,button{font:inherit;padding:8px;border-radius:6px;border:1px solid #444;background:#222;color:inherit}
+  button{background:#2f6fed;border-color:#2f6fed;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .row{display:flex;gap:12px}.row label{flex:1}
+  progress{width:100%}
+  #out{display:none;gap:12px}
+  #preview{max-width:100%;background:repeating-conic-gradient(#222 0 25%,#333 0 50%) 0 0/20px 20px}
+  small{color:#999}
+</style>
+<main>
+  <h1>Video → smooth animated WebP</h1>
+  <label>Video file <input id="file" type="file" accept="video/*"></label>
+  <div class="row">
+    <label>FPS <input id="fps" type="number" value="30" min="1" max="60"></label>
+    <label>Fit inside (W×H) <input id="size" value="1140x810"></label>
+  </div>
+  <button id="go" disabled>Convert</button>
+  <progress id="bar" value="0" max="1" hidden></progress>
+  <small id="status">Select a video. Runs entirely in your browser; nothing is uploaded.</small>
+  <div id="out">
+    <img id="preview">
+    <a id="dl" download><button type="button">Download</button></a>
+    <small id="info"></small>
+  </div>
+</main>
+<script src="ffmpeg/ffmpeg.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const u32 = (b, o) => b[o] | b[o + 1] << 8 | b[o + 2] << 16 | b[o + 3] * 2 ** 24;
+const le = (n, bytes) => Array.from({length: bytes}, (_, i) => (n >>> (8 * i)) & 255);
+
+// Raw RIFF chunks (header + padding included) holding image data, e.g. VP8L or ALPH+VP8
+function imageChunks(u8) {
+  const out = [];
+  for (let p = 12; p < u8.length;) {
+    const id = String.fromCharCode(...u8.subarray(p, p + 4)), size = u32(u8, p + 4), len = 8 + size + (size & 1);
+    if (!['VP8X', 'ICCP', 'EXIF', 'XMP ', 'ANIM', 'ANMF'].includes(id)) out.push(u8.subarray(p, p + len));
+    p += len;
+  }
+  return out;
+}
+
+// Pixel size of a single-frame webp (VP8X canvas, or the VP8L header for a simple lossless file)
+function webpSize(u8) {
+  const id = String.fromCharCode(...u8.subarray(12, 16));
+  if (id === 'VP8X') return [1 + (u32(u8, 24) & 0xffffff), 1 + (u32(u8, 27) & 0xffffff)];
+  const bits = u32(u8, 21);   // VP8L: 'VP8L' + size(4) + 0x2f signature, then 14-bit w-1 and h-1
+  return [(bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1];
+}
+
+const chunk = (id, ...parts) => {
+  const size = parts.reduce((n, p) => n + p.length, 0);
+  return [new Uint8Array([...[...id].map(c => c.charCodeAt(0)), ...le(size, 4)]), ...parts, ...(size & 1 ? [new Uint8Array(1)] : [])];
+};
+
+// Animated WebP from [{data, duration}] where data = single-frame webp bytes, w/h = canvas size
+function muxAnimatedWebp(frames, w, h) {
+  const body = [
+    ...chunk('VP8X', new Uint8Array([0x12, 0, 0, 0, ...le(w - 1, 3), ...le(h - 1, 3)])),   // animation + alpha
+    ...chunk('ANIM', new Uint8Array([0, 0, 0, 0, 0, 0])),                                  // transparent bg, loop forever
+    ...frames.flatMap(f => chunk('ANMF', new Uint8Array([
+      ...le(f.x / 2, 3), ...le(f.y / 2, 3), ...le(f.w - 1, 3), ...le(f.h - 1, 3), ...le(f.duration, 3),
+      f.blend ? 0 : 2,                                                                     // bit1 = don't blend (replace)
+    ]), ...imageChunks(f.data))),
+  ];
+  const size = 4 + body.reduce((n, p) => n + p.length, 0);
+  return new Blob([new Uint8Array([82, 73, 70, 70, ...le(size, 4), 87, 69, 66, 80]), ...body], {type: 'image/webp'});
+}
+
+let ffmpeg;
+async function getFfmpeg() {
+  if (ffmpeg) return ffmpeg;
+  ffmpeg = new FFmpegWASM.FFmpeg();
+  const abs = p => new URL(p, location.href).href;  // worker resolves relative paths against its own URL
+  await ffmpeg.load({coreURL: abs('ffmpeg/ffmpeg-core.js'), wasmURL: abs('ffmpeg/ffmpeg-core.wasm')});
+  return ffmpeg;
+}
+
+async function convert(file, fps, size, onStatus = () => {}, onProgress = () => {}) {
+  const [maxW, maxH] = size.split('x').map(Number);
+  onStatus('Loading converter (first time ~30 MB)…');
+  const ff = await getFfmpeg();
+  const progress = ({progress}) => onProgress(Math.min(1, Math.max(0, progress)));
+  ff.on('progress', progress);
+  try {
+    const ext = (file.name.match(/\.(\w+)$/) || [, 'mp4'])[1].toLowerCase();
+    const inName = `in.${ext}`;
+    await ff.writeFile(inName, new Uint8Array(await file.arrayBuffer()));
+
+    onStatus('Converting frames…');
+    // libvpx-vp9 decoder keeps webm alpha (the default decoder drops it)
+    const dec = ext === 'webm' ? ['-c:v', 'libvpx-vp9'] : [];
+    const vf = `fps=${fps},scale=${maxW}:${maxH}:force_original_aspect_ratio=decrease:flags=lanczos,format=rgba`;
+    if (await ff.exec([...dec, '-i', inName, '-vf', vf, '-c:v', 'libwebp', '-lossless', '1', '-compression_level', '3', 'f_%05d.webp'])) throw new Error('ffmpeg failed to convert this file');
+    await ff.deleteFile(inName);
+
+    // 1x1 transparent frame, used as the cheap second half of each doubled frame
+    await ff.exec(['-f', 'lavfi', '-i', 'color=c=0x00000000:s=1x1:d=1,format=rgba', '-frames:v', '1', '-c:v', 'libwebp', '-lossless', '1', 'blank.webp']);
+    const blank = await ff.readFile('blank.webp');
+
+    onStatus('Building WebP…');
+    const names = (await ff.listDir('/')).map(f => f.name).filter(n => /^f_\d+\.webp$/.test(n)).sort();
+    if (!names.length) throw new Error('No frames produced');
+    // Each source frame is shown twice (~1 display refresh each at 60Hz); delays are whole ms so split each
+    // slot to keep the total exact. The 2nd copy is a 1x1 transparent blended overlay = no visible change.
+    const frames = [];
+    let w, h;   // output size = source aspect ratio fitted inside the requested size
+    for (let i = 0; i < names.length; i++) {
+      const data = await ff.readFile(names[i]);
+      if (!i) [w, h] = webpSize(data);
+      const [t0, mid, t1] = [0, .5, 1].map(k => Math.round((i + k) * 1000 / fps));
+      frames.push({data, x: 0, y: 0, w, h, duration: mid - t0, blend: false},
+                  {data: blank, x: 0, y: 0, w: 1, h: 1, duration: t1 - mid, blend: true});
+      await ff.deleteFile(names[i]);
+    }
+    return {blob: muxAnimatedWebp(frames, w, h), frames: names.length};
+  } finally { ff.off('progress', progress); }
+}
+
+$('file').onchange = () => $('go').disabled = !$('file').files[0];
+$('go').onclick = async () => {
+  const file = $('file').files[0];
+  if (!/^\d+x\d+$/.test($('size').value)) return $('status').textContent = 'Size must look like 1140x810';
+  $('go').disabled = true; $('bar').hidden = false; $('out').style.display = 'none'; $('bar').value = 0;
+  try {
+    const {blob, frames} = await convert(file, +$('fps').value, $('size').value, s => $('status').textContent = s, p => $('bar').value = p);
+    const url = URL.createObjectURL(blob);
+    $('preview').src = url;
+    $('dl').href = url; $('dl').download = file.name.replace(/\.[^.]+$/, '') + '.webp';
+    $('info').textContent = `${frames} source frames, ${(blob.size / 1e6).toFixed(1)} MB`;
+    $('out').style.display = 'grid'; $('status').textContent = 'Done.';
+  } catch (e) { $('status').textContent = 'Error: ' + e.message; }
+  $('go').disabled = false; $('bar').hidden = true;
+};
+</script>
